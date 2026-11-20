@@ -1,0 +1,49 @@
+# BastionGuard 模拟实验环境
+# 三台主机共用一个镜像，靠 ROLE 区分；登录公钥由根目录 .env 的 PUBLIC_KEY 注入。
+x-bastion-base: &bastion-base
+  image: bastion-host:latest
+  build:
+    context: ./host-image
+  env_file:
+    - .env
+  networks:
+    - labnet
+  volumes:
+    - audit-data:/var/log/audit
+    - data-lib:/var/lib
+
+services:
+  app-01:
+    <<: *bastion-base
+    container_name: bg-app-01
+    hostname: app-01
+    environment:
+      ROLE: app
+    ports:
+      - "127.0.0.1:2201:2222"
+
+  db-01:
+    <<: *bastion-base
+    container_name: bg-db-01
+    hostname: db-01
+    environment:
+      ROLE: database
+    ports:
+      - "127.0.0.1:2202:2222"
+
+  web-01:
+    <<: *bastion-base
+    container_name: bg-web-01
+    hostname: web-01
+    environment:
+      ROLE: web
+    ports:
+      - "127.0.0.1:2203:2222"
+
+networks:
+  labnet:
+    name: bastion-lab
+
+volumes:
+  audit-data:
+  data-lib:

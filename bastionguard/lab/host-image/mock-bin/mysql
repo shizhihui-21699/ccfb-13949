@@ -1,0 +1,11 @@
+#!/bin/sh
+# 模拟 mysql：回显 -e 的 SQL，识别破坏性语句
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -e|--execute) shift; SQL="$1";;
+    *) ;;
+  esac
+  shift
+done
+echo "[mock-mysql] received SQL: ${SQL:-<interactive>}"
+echo "$SQL" | grep -qiE 'DROP|TRUNCATE|DELETE FROM' && echo "[mock-mysql] WARNING destructive statement" 

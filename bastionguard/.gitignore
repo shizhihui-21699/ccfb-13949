@@ -1,0 +1,14 @@
+# 编译产物
+/bguard
+/cmd/bguard/bguard
+*.test
+.out
+
+# 运行期审计与数据
+/audit-data/
+/lab/keys/
+/lab/.env
+
+# 本地 host key
+/lab/host_key
+*.log

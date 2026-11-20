@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "[mock-auditctl] $*"
+case "$1" in -D|-W) echo "[mock-auditctl] would alter audit rules";; esac

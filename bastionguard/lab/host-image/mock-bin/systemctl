@@ -1,0 +1,13 @@
+#!/bin/sh
+# 模拟 systemctl：识别子命令并回显，让堡垒机规则在真实会话中可验证
+ACTION="$1"; shift
+UNIT="$1"
+case "$ACTION" in
+  stop|disable|mask|start|enable|restart|status|reload)
+    echo "[mock-systemctl] $ACTION $UNIT (role=${ROLE:-app})"
+    ;;
+  *)
+    echo "[mock-systemctl] unsupported: $*" >&2
+    exit 2
+    ;;
+esac

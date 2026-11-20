@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "[mock-redis] $*"
+case "$(echo "$1" | tr 'a-z' 'A-Z')" in FLUSHALL|FLUSHDB) echo "[mock-redis] would wipe all keys";; esac
